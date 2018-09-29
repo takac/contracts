@@ -415,10 +415,11 @@ __version__ = "$Id$"
 __email__ = "jking@deadpixi.com"
 __status__ = "Alpha"
 
-from collections import namedtuple
+from collections import namedtuple, abc
 from functools import wraps
 from inspect import isfunction, ismethod, iscoroutinefunction, getfullargspec
 from sys import version_info
+import typing
 
 if version_info[:2] < (3, 5):
     raise ImportError('dpcontracts >= 0.6 requires Python 3.5 or later.')
@@ -468,14 +469,14 @@ def arg_count(func):
     named, vargs, _, defs, kwonly, kwonlydefs, _ = getfullargspec(func)
     return len(named) + len(kwonly) + (1 if vargs else 0)
 
-def condition(description, predicate, precondition=False, postcondition=False, instance=False):
+def condition(description, predicate, precondition=False, postcondition=False, instance=False, dynamic=False):
     assert isinstance(description, str), "contract descriptions must be strings"
     assert len(description) > 0, "contracts must have nonempty descriptions"
     assert isfunction(predicate), "contract predicates must be functions"
     assert not iscoroutinefunction(predicate), "contract predicates cannot be coroutines"
     assert precondition or postcondition, "contracts must be at least one of pre- or post-conditional"
-    assert arg_count(predicate) == (1 if precondition or instance else 2), \
-           "contract predicates must take the correct number of arguments"
+    # assert arg_count(predicate) == (1 if precondition or instance else 2), \
+    #        "contract predicates must take the correct number of arguments"
 
     def require(f):
         wrapped = get_wrapped_func(f)
@@ -503,8 +504,13 @@ def condition(description, predicate, precondition=False, postcondition=False, i
             def inner(*args, **kwargs):
                 rargs = build_call(f, *args, **kwargs) if not instance else args[0]
 
-                if precondition and not predicate(rargs):
-                    raise PreconditionError(description)
+                if precondition:
+                    if dynamic:
+                        res = predicate(rargs, f)
+                    else:
+                        res = predicate(rargs)
+                    if not res:
+                        raise PreconditionError(description)
 
                 result = f(*args, **kwargs)
 
@@ -545,6 +551,124 @@ def transform(transformer):
             return f(**(rargs._asdict()))
         return inner
     return func
+
+def pytypes():
+    """
+    Use python's type hints on arguments as preconditions.
+
+    >>> @pytypes()
+    ... def add2(i: int, j: int):
+    ...     return i + j
+    >>> add2(1, 2)
+    3
+    >>> add2("foo", 2)
+    Traceback (most recent call last):
+    PreconditionError: the types of arguments must be valid
+
+    >>> from typing import List, Tuple, Generator, Callable, Any, Union, Text, Sequence
+
+    Please note it's not possible to runtime check generics, only the top level
+    type can be checked. E.g. given type hint of `Sequence[int]` we can *only*
+    check that the instance is a `Sequence`.
+
+    >>> @pytypes()
+    ... def summer(nums: Sequence[int], start):
+    ...     for i in nums:
+    ...         start += i
+    ...     return start
+
+    >>> summer([1, 2, 3], 0)
+    6
+    >>> summer("abc", "z")
+    'zabc'
+    >>> summer(2, "z")
+    Traceback (most recent call last):
+    PreconditionError: the types of arguments must be valid
+
+    >>> @pytypes()
+    ... def mult(ls: List[int], f: Tuple[float, float]):
+    ...     return list(map(lambda i: i * f[0], ls))
+    >>> mult([1, 2, 3], (2.5, 1.5))
+    [2.5, 5.0, 7.5]
+    >>> mult([1, 2, 3], [2.5, 1.5])
+    Traceback (most recent call last):
+    PreconditionError: the types of arguments must be valid
+
+    >>> @pytypes()
+    ... def gen(g: Generator[int, None, None]):
+    ...     return list(g)
+    >>> gen(x for x in range(4))
+    [0, 1, 2, 3]
+    >>> gen(range(4)) # note range is it's own type, not a generator
+    Traceback (most recent call last):
+    PreconditionError: the types of arguments must be valid
+
+    >>> @pytypes()
+    ... def call(fn: Callable[[int], float]) -> float:
+    ...     return fn(5)
+    >>> call(float)
+    5.0
+    >>> call(2)
+    Traceback (most recent call last):
+    PreconditionError: the types of arguments must be valid
+
+    >>> @pytypes()
+    ... def take2(x: Any, i: int):
+    ...     return x
+    >>> take2(100, 1)
+    100
+    >>> take2(str, 2)
+    <class 'str'>
+
+    >>> @pytypes()
+    ... def moniod(x: Union[bytes, Union[int, str]]):
+    ...     return x + x
+    >>> moniod("abc")
+    'abcabc'
+    >>> moniod(10)
+    20
+    >>> moniod(b"baa")
+    b'baabaa'
+    >>> moniod(1.4)
+    Traceback (most recent call last):
+    PreconditionError: the types of arguments must be valid
+    """
+    # Any, Union, Tuple, Callable, TypeVar, and Generic
+
+    def predicate(args, function):
+        arg_annotations = function.__annotations__
+        if 'return' in arg_annotations:
+            arg_annotations.pop('return')
+        for name, kind in arg_annotations.items():
+            assert hasattr(args, name), "missing required argument `%s`" % name
+            if not check_type(args, name, kind):
+                return False
+        return True
+
+    return condition("the types of arguments must be valid", predicate, True, dynamic=True)
+
+def check_type(args, name, kind):
+    arg = getattr(args, name)
+    if isinstance(kind, type):  # primitive
+        if not type(arg) == kind:
+            return False
+    elif isinstance(kind, typing._GenericAlias):
+        root_kind = kind.__origin__
+        if root_kind == typing.Union:
+            if not any(check_type(args, name, t) for t in kind.__args__):
+                return False
+        elif root_kind == abc.Sequence:
+            if not isinstance(arg, abc.Sequence):
+                return False
+        elif root_kind == abc.Generator:
+            if not isinstance(arg, abc.Generator):
+                return False
+        elif root_kind == abc.Callable:
+            if not isinstance(arg, abc.Callable):
+                return False
+        elif not type(arg) == root_kind:
+            return False
+    return True
 
 def types(**requirements):
     """
